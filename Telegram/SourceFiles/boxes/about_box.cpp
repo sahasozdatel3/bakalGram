@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/about_box.h"
+#include "bakal/bakal_brand.h"
 
 #include "base/platform/base_platform_info.h"
 #include "core/application.h"
@@ -44,18 +45,28 @@ rpl::producer<TextWithEntities> Text() {
 		lt_gpl_link,
 		rpl::single(Ui::Text::Link(
 			"GNU GPL",
-			"https://github.com/AyuGram/AyuGramDesktop/blob/dev/LICENSE")),
+			Bakal::RepoUrl() + "/blob/dev/LICENSE")),
 		lt_github_link,
 		rpl::single(Ui::Text::Link(
 			"GitHub",
-			"https://github.com/AyuGram/AyuGramDesktop")),
-		tr::marked);
+			Bakal::RepoUrl())),
+		tr::marked
+	) | rpl::map([](TextWithEntities text) {
+		// bakalGram: credit the client we are built on.
+		return text
+			.append(u"\n\n"_q)
+			.append(Bakal::ShortName() + u" is based on "_q)
+			.append(Ui::Text::Link(
+				Bakal::UpstreamName(),
+				Bakal::UpstreamRepoUrl()))
+			.append(u" by Radolyn Labs."_q);
+	});
 }
 
 } // namespace
 
 void AboutBox(not_null<Ui::GenericBox*> box, Window::SessionController* controller) {
-	box->setTitle(rpl::single(u"AyuGram Desktop"_q));
+	box->setTitle(rpl::single(Bakal::FullName()));
 
 	auto layout = box->verticalLayout();
 

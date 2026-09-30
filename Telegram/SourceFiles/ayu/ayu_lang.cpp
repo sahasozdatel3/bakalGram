@@ -5,6 +5,7 @@
 //
 // Copyright @Radolyn, 2026
 #include "ayu/ayu_lang.h"
+#include "bakal/bakal_brand.h"
 
 #include "qjsondocument.h"
 #include "core/application.h"
@@ -194,6 +195,11 @@ void AyuLanguage::applyLanguageJson(QJsonDocument doc) {
 
 		if (key.endsWith("_PC")) {
 			key = key.replace("_PC", "");
+		}
+
+		// bakalGram: show our name in translated AyuGram strings too.
+		if (!Bakal::IsAttributionKey(key.section('#', 0, 0))) {
+			val = Bakal::Rebrand(val);
 		}
 
 		if (val.contains(qsl("%1$d")) && !val.contains(qsl("%2$d"))) {

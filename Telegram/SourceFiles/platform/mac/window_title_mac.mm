@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/platform_window_title.h"
+#include "bakal/bakal_brand.h"
 
 #include "ui/image/image_prepare.h"
 #include "ui/painter.h"
@@ -79,7 +80,7 @@ void PreviewWindowTitle(Painter &p, const style::palette &palette, QRect body, i
 	p.setPen(st::titleFgActive[palette]);
 	p.setFont(font);
 
-	p.drawText(titleRect, u"AyuGram"_q, style::al_center);
+	p.drawText(titleRect, Bakal::ShortName(), style::al_center);
 
 	auto isGraphite = ([NSColor currentControlTint] == NSGraphiteControlTint);
 	auto buttonSkip = 8;

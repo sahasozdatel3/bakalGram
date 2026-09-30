@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/window_main_menu.h"
+#include "bakal/bakal_brand.h"
 
 #include "apiwrap.h"
 #include "base/event_filter.h"
@@ -391,8 +392,8 @@ MainMenu::MainMenu(
 	parentResized();
 
 	_telegram->setMarkedText(tr::link(
-		u"AyuGram Desktop"_q,
-		u"https://ayugram.one"_q));
+		Bakal::FullName(),
+		Bakal::RepoUrl()));
 	_telegram->setLinksTrusted();
 	_version->setMarkedText(
 		tr::link(

@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/mac/global_menu_mac.h"
+#include "bakal/bakal_brand.h"
 
 #include "core/application.h"
 #include "core/sandbox.h"
@@ -418,7 +419,7 @@ void Manager::buildAppleMenu(QMenu *main) {
 			});
 		};
 		const auto about = main->addAction(
-			u"About AyuGram"_q,
+			u"About "_q + Bakal::ShortName(),
 			std::move(callback));
 		about->setMenuRole(QAction::AboutQtRole);
 	}
@@ -720,7 +721,7 @@ void Manager::buildWindowMenu(QMenu *window) {
 }
 
 void Manager::buildMenu() {
-	buildAppleMenu(_menuBar->addMenu(u"AyuGram"_q));
+	buildAppleMenu(_menuBar->addMenu(Bakal::ShortName()));
 	buildFileMenu(_menuBar->addMenu(u"File"_q));
 	buildEditMenu(_menuBar->addMenu(u"Edit"_q));
 

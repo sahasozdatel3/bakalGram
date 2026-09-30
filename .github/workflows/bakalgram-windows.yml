@@ -1,0 +1,566 @@
+name: bakalGram Windows
+
+# Builds bakalGram.exe (Windows x64, Release) on free GitHub runners and
+# publishes it on the Releases page.
+#
+# Two jobs, each with its own 6-hour limit:
+#   libraries  builds Qt, ffmpeg, OpenSSL, WebRTC and the rest once, and
+#              keeps them in the Actions cache. The very first run may not
+#              fit into 6 hours; then it saves what it has and starts the
+#              workflow again by itself to continue (up to 4 times).
+#   build      compiles bakalGram itself against the cached libraries,
+#              packs a zip and makes a GitHub Release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempt:
+        description: 'Continuation counter (set automatically, leave 1).'
+        type: string
+        default: '1'
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'changelog.txt'
+      - 'LEGAL'
+      - 'LICENSE'
+      - 'snap/**'
+      - 'lib/xdg/**'
+      - 'Telegram/build/docker/**'
+      - 'Telegram/SourceFiles/platform/linux/**'
+      - 'Telegram/SourceFiles/platform/mac/**'
+  schedule:
+    # Touch the caches twice a week so GitHub doesn't evict them after
+    # 7 days of inactivity. Only the libraries job runs, and it is quick
+    # when nothing changed.
+    - cron: '17 3 * * 1,4'
+
+permissions:
+  contents: write  # create releases
+  actions: write   # re-dispatch this workflow to continue a long first run
+
+concurrency:
+  group: bakalgram-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REPO_NAME: tdesktop
+  PREPARE_PATH: Telegram/build/prepare/prepare.py
+  # Minutes the library build may run before we stop it and bank progress.
+  LIBS_BUDGET_MINUTES: '290'
+  MAX_ATTEMPTS: '4'
+
+jobs:
+
+  libraries:
+    name: Libraries
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    outputs:
+      incomplete: ${{ steps.libs.outputs.incomplete }}
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Free up runner disk space.
+        shell: pwsh
+        run: |
+          function Show-Free($label) {
+            Write-Host ("{0}: {1:N1} GB free on C:" -f $label, ((Get-PSDrive C).Free / 1GB))
+          }
+          Show-Free 'before'
+          $targets = @(
+            'C:\Android',
+            'C:\Miniconda',
+            'C:\Julia',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\MySQL',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files\Amazon',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server',
+            'C:\Program Files (x86)\Google',
+            'C:\Program Files\R',
+            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\tools\kotlinc',
+            'C:\SeleniumWebDrivers'
+          )
+          foreach ($target in $targets) {
+            if (Test-Path $target) {
+              Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+            }
+          }
+          Show-Free 'after'
+
+      # Build on D: when present (bigger), keep a short fixed path for Qt.
+      - name: Prepare directories.
+        run: |
+          if exist D:\ (
+            mkdir D:\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild D:\TBuild
+          ) else (
+            mkdir %userprofile%\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          )
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "Windows SDK: $SDK"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "release" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          # prepare.py cherry-picks patches, which needs an identity.
+          git config --global user.email "bakalgram@users.noreply.github.com"
+          git config --global user.name "bakalGram CI"
+
+      # AyuGram needs the 14.44 toolset (VS 2022 based, keeps Windows 7 support).
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      # breakpad's dump_syms wants ATL at a legacy path newer VS dropped.
+      - name: Make ATL available.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          Write-Host "Visual Studio: $vs"
+          function Find-AtlRoot {
+            if ($env:VCToolsInstallDir) {
+              $preferred = Join-Path $env:VCToolsInstallDir 'atlmfc'
+              if (Test-Path (Join-Path $preferred 'include\atlbase.h')) { return $preferred }
+            }
+            $found = Get-ChildItem "$vs\VC\Tools\MSVC\*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) { return (Split-Path (Split-Path $found.FullName -Parent) -Parent) }
+            return $null
+          }
+          $atlRoot = Find-AtlRoot
+          if (-not $atlRoot) {
+            Write-Host 'ATL is not installed, adding the component.'
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+              'modify', '--installPath', "`"$vs`"", `
+              '--add', 'Microsoft.VisualStudio.Component.VC.ATL', `
+              '--quiet', '--norestart', '--nocache'
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              Write-Error "vs_installer failed with $($p.ExitCode)"; exit 1
+            }
+            $atlRoot = Find-AtlRoot
+          }
+          if (-not $atlRoot) { Write-Error 'atlbase.h still not found'; exit 1 }
+          Write-Host "ATL root: $atlRoot"
+          $legacy = Join-Path $vs 'VC\atlmfc'
+          $toolset = Join-Path $env:VCToolsInstallDir 'atlmfc'
+          foreach ($link in @($legacy, $toolset)) {
+            if (-not (Test-Path $link)) {
+              New-Item -ItemType Junction -Path $link -Target $atlRoot | Out-Null
+              Write-Host "Linked $link -> $atlRoot"
+            }
+          }
+
+      # Restore and save are split so progress is kept even when the
+      # library build is stopped halfway.
+      - name: Restore ThirdParty cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: bakal-win64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: bakal-win64-third-party-
+
+      - name: Restore libraries cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: bakal-win64-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: bakal-win64-libs-
+
+      - name: Restore Qt cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: bakal-win64-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: bakal-win64-qt-
+
+      # A restored cache that lost a needed file still looks "built"; drop
+      # its key so prepare.py builds that stage again.
+      - name: Heal stale cache keys.
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || exit 0
+          drop() {
+            rm -f "$LibrariesPath"/cache_keys/$1
+            echo "$2, dropped the $1 cache key"
+          }
+          if [ -f "$LibrariesPath/cache_keys/tg_angle" ]; then
+            [ -f "$LibrariesPath/tg_angle/out/Release/tg_angle.lib" ] \
+              || drop tg_angle "ANGLE library missing"
+          fi
+          if [ -f "$LibrariesPath/cache_keys/nv-codec-headers" ]; then
+            [ -f "$LibrariesPath/nv-codec-headers/Makefile" ] \
+              || drop nv-codec-headers "nv-codec-headers makefile missing"
+          fi
+
+      - name: Remember library state.
+        shell: bash
+        run: |
+          state() {
+            find "$LibrariesPath/cache_keys" "$TBUILD/ThirdParty/cache_keys" -type f 2>/dev/null \
+              | sort | xargs -r cat | sha256sum | awk '{ print $1 }'
+          }
+          echo "LIBS_STATE_BEFORE=$(state)" >> $GITHUB_ENV
+
+      # Runs prepare.py under a watchdog: if it doesn't finish within the
+      # budget, the whole process tree is stopped, progress is saved below
+      # and the "continue" job starts a fresh run that picks up from there.
+      - name: Libraries.
+        id: libs
+        shell: pwsh
+        run: |
+          $budget = [int]$env:LIBS_BUDGET_MINUTES
+          $bat = "$env:TBUILD\$env:REPO_NAME\Telegram\build\prepare\win.bat"
+          Write-Host "Building libraries, budget $budget minutes."
+          $p = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', "$bat silent" `
+            -NoNewWindow -PassThru
+          if (-not $p.WaitForExit($budget * 60 * 1000)) {
+            Write-Host "::warning::Library build did not finish in $budget minutes, saving progress to continue in the next run."
+            taskkill /T /F /PID $p.Id | Out-Null
+            Start-Sleep -Seconds 15
+            "incomplete=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "Library build failed with exit code $($p.ExitCode)."
+            exit $p.ExitCode
+          }
+          "incomplete=false" >> $env:GITHUB_OUTPUT
+
+      - name: Free up some disk space.
+        if: always()
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || { echo "nothing to clean up"; exit 0; }
+          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' -o -path '*/gas-preprocessor/*' ')' -type f ')' -o -empty ')' -delete || true
+
+      - name: Check whether anything changed.
+        if: always()
+        shell: bash
+        run: |
+          state() {
+            find "$LibrariesPath/cache_keys" "$TBUILD/ThirdParty/cache_keys" -type f 2>/dev/null \
+              | sort | xargs -r cat | sha256sum | awk '{ print $1 }'
+          }
+          after=$(state)
+          if [ "$after" != "$LIBS_STATE_BEFORE" ]; then
+            echo "Libraries changed, the caches will be saved."
+            echo "SAVE_CACHES=true" >> $GITHUB_ENV
+          else
+            echo "Nothing new was built, the caches stay as they are."
+            echo "SAVE_CACHES=false" >> $GITHUB_ENV
+          fi
+
+      - name: Save ThirdParty cache.
+        if: always() && env.SAVE_CACHES == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: bakal-win64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save libraries cache.
+        if: always() && env.SAVE_CACHES == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: bakal-win64-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Qt cache.
+        if: always() && env.SAVE_CACHES == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: bakal-win64-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+  build:
+    name: bakalGram
+    needs: libraries
+    if: github.event_name != 'schedule' && needs.libraries.outputs.incomplete == 'false'
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Free up runner disk space.
+        shell: pwsh
+        run: |
+          function Show-Free($label) {
+            Write-Host ("{0}: {1:N1} GB free on C:" -f $label, ((Get-PSDrive C).Free / 1GB))
+          }
+          Show-Free 'before'
+          $targets = @(
+            'C:\Android',
+            'C:\Miniconda',
+            'C:\Julia',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\MySQL',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files\Amazon',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server',
+            'C:\Program Files (x86)\Google',
+            'C:\Program Files\R',
+            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\tools\kotlinc',
+            'C:\SeleniumWebDrivers'
+          )
+          foreach ($target in $targets) {
+            if (Test-Path $target) {
+              Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+            }
+          }
+          Show-Free 'after'
+
+      - name: Prepare directories.
+        run: |
+          if exist D:\ (
+            mkdir D:\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild D:\TBuild
+          ) else (
+            mkdir %userprofile%\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          )
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "Windows SDK: $SDK"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "release" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          # prepare.py cherry-picks patches, which needs an identity.
+          git config --global user.email "bakalgram@users.noreply.github.com"
+          git config --global user.name "bakalGram CI"
+
+      - name: Read version.
+        shell: bash
+        run: |
+          awk 'NF { print $1"="$2 }' $TBUILD/$REPO_NAME/Telegram/build/version >> $GITHUB_ENV
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      # CMake fetches WebView2 and friends through NuGet at configure time.
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Restore ThirdParty cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: bakal-win64-third-party-${{ env.CACHE_KEY }}
+          restore-keys: |
+            bakal-win64-third-party-${{ env.CACHE_KEY }}-
+            bakal-win64-third-party-
+          fail-on-cache-miss: true
+
+      - name: Restore libraries cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: bakal-win64-libs-${{ env.CACHE_KEY }}
+          restore-keys: |
+            bakal-win64-libs-${{ env.CACHE_KEY }}-
+            bakal-win64-libs-
+          fail-on-cache-miss: true
+
+      - name: Restore Qt cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: bakal-win64-qt-${{ env.CACHE_KEY }}
+          restore-keys: |
+            bakal-win64-qt-${{ env.CACHE_KEY }}-
+            bakal-win64-qt-
+          fail-on-cache-miss: true
+
+      - name: Configure.
+        env:
+          # Your own keys from my.telegram.org can be put into the repository
+          # secrets TDESKTOP_API_ID / TDESKTOP_API_HASH. Otherwise the keys
+          # from AyuGram's docs/api_credentials.md are used, as AyuGram does.
+          API_ID: ${{ secrets.TDESKTOP_API_ID || '2040' }}
+          API_HASH: ${{ secrets.TDESKTOP_API_HASH || 'b18441a1ff607e10a989891a5462e627' }}
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+          rem Auto-update is off: it would pull official AyuGram over bakalGram.
+          call configure.bat x64 ^
+            -D TDESKTOP_API_ID=%API_ID% ^
+            -D TDESKTOP_API_HASH=%API_HASH% ^
+            -D CMAKE_CONFIGURATION_TYPES=Release ^
+            -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= ^
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON || exit /b 1
+
+      - name: Build bakalGram.
+        env:
+          # Two compilers per project, two projects at a time: fits in 16 GB.
+          _CL_: /MP2
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+          cmake --build ..\out --config Release --target Telegram --parallel 2
+
+      - name: Pack.
+        shell: pwsh
+        run: |
+          $release = "$env:TBUILD\$env:REPO_NAME\out\Release"
+          $exe = Join-Path $release 'bakalGram.exe'
+          if (-not (Test-Path $exe)) { Write-Error "bakalGram.exe is missing from $release"; exit 1 }
+
+          $deploy = Join-Path $env:GITHUB_WORKSPACE 'deploy'
+          $dir = Join-Path $deploy 'bakalGram'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Copy-Item $exe $dir
+          # DirectX compiler for Windows 7/8, when the build produced one.
+          $modules = Join-Path $release 'modules'
+          if (Test-Path $modules) { Copy-Item $modules $dir -Recurse }
+
+          $zip = "bakalGram-win64-$env:AppVersionStr-$env:GITHUB_RUN_NUMBER.zip"
+          Set-Location $deploy
+          & 7z a -mx9 $zip bakalGram\
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & 7z t $zip
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+          Get-ChildItem -Recurse $deploy | Format-Table FullName, Length
+
+      - uses: actions/upload-artifact@v7
+        name: Upload artifact.
+        with:
+          name: bakalGram win64 ${{ env.AppVersionStr }} (${{ github.run_number }})
+          path: deploy\${{ env.ZIP_NAME }}
+          retention-days: 30
+
+      - name: Publish release.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v${AppVersionStr}-bakal.${GITHUB_RUN_NUMBER}"
+          NOTES=$(cat <<EOF
+          bakalGram ${AppVersionStr} для Windows (x64), сборка №${GITHUB_RUN_NUMBER} из коммита ${SHORT_SHA}.
+
+          Как поставить: скачай **${ZIP_NAME}** ниже, распакуй в любую папку и запусти **bakalGram.exe**.
+          Если Windows покажет «Система Windows защитила ваш компьютер» — нажми «Подробнее» → «Выполнить в любом случае» (у сборки нет платной цифровой подписи).
+
+          Основано на [AyuGram Desktop](https://github.com/AyuGram/AyuGramDesktop) ${AppVersionStr}.
+          EOF
+          )
+          gh release create "$TAG" "deploy/$ZIP_NAME" \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "bakalGram $AppVersionStr (сборка $GITHUB_RUN_NUMBER)" \
+            --notes "$NOTES" \
+            --latest
+
+  continue:
+    name: Continue in a new run
+    needs: libraries
+    if: always() && needs.libraries.outputs.incomplete == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the next run.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ inputs.attempt || '1' }}
+        run: |
+          if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::error::Libraries still not finished after $ATTEMPT runs, stopping. Start the workflow again by hand to continue."
+            exit 1
+          fi
+          NEXT=$((ATTEMPT + 1))
+          echo "Libraries are not finished yet, starting run $NEXT of $MAX_ATTEMPTS."
+          gh workflow run bakalgram-windows.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f attempt=$NEXT

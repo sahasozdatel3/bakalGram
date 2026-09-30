@@ -2,7 +2,7 @@
 
 ![AyuGram Лого](.github/AyuGram.png) ![AyuChan](.github/AyuChan.png)
 
-[ [English](README.md)  | Русский ]
+[ [English](README-AyuGram.md)  | Русский ]
 
 ## Функции и Фишки
 
